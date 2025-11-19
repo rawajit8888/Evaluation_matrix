@@ -1,116 +1,155 @@
-import json
-import numpy as np
+# DIAGNOSTIC SCRIPT: Run this EXACTLY (edit only file/model paths if needed)
+import json, os, pickle, numpy as np, pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
-import pandas as pd
-import pickle
 
-# ----------------------------
-# Load JSON from Label Studio
-# ----------------------------
-def load_labelstudio(path):
+# ---------- CONFIG (change only paths if necessary) ----------
+JSON_PATH = "project.json"                    # your exported labelstudio JSON
+MODEL_DIR = "model_folder"                    # your HF model folder
+ENCODER_FILE = "encoders/label_encoder.pkl"   # the one you created
+MAX_EXAMPLES_TO_SHOW = 20
+BATCH_SIZE = 16
+# ------------------------------------------------------------
+
+# ---------- 1) load and extract robust full-path labels ----------
+def load_data(path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-
-    texts = []
-    labels = []
-
+    texts, labels = [], []
     for task in data:
-        text = task["data"]["html"]
-
+        text = task["data"].get("html") or task["data"].get("text") or ""
+        # find first taxonomy result
+        full_label = None
         for ann in task.get("annotations", []):
             for res in ann.get("result", []):
-                if res.get("type") == "taxonomy":
+                if res.get("type") == "taxonomy':
                     cats = res["value"].get("taxonomy", [])
-                    if isinstance(cats, list) and len(cats) > 0:
-                        full_label = " > ".join(cats)   # FULL PATH
-                        texts.append(text)
-                        labels.append(full_label)
-
+                    # make list of strings (flatten nested lists and drop non-strings)
+                    clean = []
+                    for c in cats:
+                        if isinstance(c, list):
+                            for x in c:
+                                if isinstance(x, str):
+                                    clean.append(x)
+                        elif isinstance(c, str):
+                            clean.append(c)
+                    if clean:
+                        full_label = " > ".join(clean)
+                        break
+            if full_label:
+                break
+        if full_label:
+            texts.append(text)
+            labels.append(full_label)
     return texts, labels
 
+texts, labels = load_data(JSON_PATH)
+print("Loaded samples:", len(texts))
 
-# ----------------------------
-# Split Data
-# ----------------------------
-def prepare_data(texts, labels):
-    return train_test_split(texts, labels, test_size=0.2, random_state=42)
+# ---------- 2) load model & encoder ----------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
 
+tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR).to(device)
+with open(ENCODER_FILE, "rb") as f:
+    le = pickle.load(f)
 
-# ----------------------------
-# Load Model + Encoder
-# ----------------------------
-def load_model(model_path, encoder_path):
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForSequenceClassification.from_pretrained(model_path)
+print("Model num_labels:", model.config.num_labels)
+print("Encoder classes count:", len(le.classes_))
+print("Sample encoder classes (first 10):")
+for i,c in enumerate(le.classes_[:10]):
+    print(i, "->", c)
 
-    with open(encoder_path, "rb") as f:
-        le = pickle.load(f)
+# ---------- 3) encode labels and split ----------
+y = le.transform(labels)   # will raise if unseen labels exist (shouldn't now)
+X_train, X_test, y_train, y_test = train_test_split(texts, y, test_size=0.20, random_state=42, stratify=y)
 
-    return tokenizer, model, le
+print("Train/test sizes:", len(X_train), len(X_test))
+# show label distribution in test
+unique, counts = np.unique(y_test, return_counts=True)
+dist = sorted(zip(unique, counts), key=lambda x: -x[1])
+print("\nTop test label support (label_index : count : label_name)")
+for idx,count in dist[:20]:
+    print(idx, ":", count, ":", le.classes_[idx])
 
-
-# ----------------------------
-# Prediction Function
-# ----------------------------
-def predict_single(texts, tokenizer, model):
-    preds = []
+# ---------- 4) batch-predict the whole X_test (collect logits for confidence) ----------
+def batch_predict(texts, tokenizer, model, batch_size=16, device=device):
     model.eval()
-
+    preds_idx = []
+    preds_probs = []
     with torch.no_grad():
-        for text in texts:
-            enc = tokenizer(text, truncation=True, padding=True, return_tensors="pt")
-            logits = model(**enc).logits
-            pred = torch.argmax(logits, dim=1).item()
-            preds.append(pred)
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i+batch_size]
+            enc = tokenizer(batch_texts, truncation=True, padding=True, return_tensors="pt").to(device)
+            out = model(**enc)
+            logits = out.logits.cpu().numpy()
+            # If model was trained single-label, use softmax; else if multi-label it would use sigmoid
+            probs = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+            probs = probs / probs.sum(axis=1, keepdims=True)   # softmax numerically stable
+            pred = probs.argmax(axis=1)
+            preds_idx.extend(pred.tolist())
+            # keep top prob per example
+            top_probs = probs[np.arange(len(pred)), pred]
+            preds_probs.extend(top_probs.tolist())
+    return np.array(preds_idx), np.array(preds_probs)
 
-    return preds
+pred_idx, pred_conf = batch_predict(X_test, tokenizer, model, batch_size=BATCH_SIZE)
+print("\nPredictions done. Sample predicted indices (first 20):", pred_idx[:20])
 
+# ---------- 5) analysis: prediction distribution ----------
+unique_pred, counts_pred = np.unique(pred_idx, return_counts=True)
+pred_dist = sorted(zip(unique_pred, counts_pred), key=lambda x: -x[1])
+print("\nTop predicted classes (index : count : label_name):")
+for idx,count in pred_dist[:20]:
+    print(idx, ":", count, ":", le.classes_[idx])
 
-# ----------------------------
-# Evaluation
-# ----------------------------
-def evaluate(y_true, y_pred, le):
+# ---------- 6) compare predictions vs true ----------
+acc = (pred_idx == y_test).mean()
+print("\nOverall accuracy (pred == true):", acc)
 
-    true_labels = le.inverse_transform(y_true)
-    pred_labels = le.inverse_transform(y_pred)
+print("\nClassification report (this may be large):")
+print(classification_report(y_test, pred_idx, target_names=le.classes_, zero_division=0))
 
-    print("\nClassification Report:\n")
-    print(classification_report(true_labels, pred_labels, zero_division=0))
+# ---------- 7) show sample rows for manual inspection ----------
+rows = []
+for i in range(min(MAX_EXAMPLES_TO_SHOW, len(X_test))):
+    rows.append({
+        "text_snippet": X_test[i][:200].replace("\n"," "),
+        "true_index": int(y_test[i]),
+        "true_label": le.inverse_transform([y_test[i]])[0],
+        "pred_index": int(pred_idx[i]),
+        "pred_label": le.inverse_transform([pred_idx[i]])[0],
+        "pred_conf": float(pred_conf[i])
+    })
+df_sample = pd.DataFrame(rows)
+print("\nSample predictions:")
+print(df_sample.to_string(index=False))
 
-    print("\nAccuracy:", accuracy_score(true_labels, pred_labels))
+# ---------- 8) confusion for top N true classes ----------
+from collections import Counter
+top_true = [idx for idx,_ in dist[:15]]
+print("\nConfusion counts for top 15 true labels (rows=true, cols=pred) [showing counts >0]:")
+cm = confusion_matrix(y_test, pred_idx)
+for r in top_true:
+    row = cm[r]
+    nonzeros = [(cidx, v) for cidx,v in enumerate(row) if v>0]
+    if nonzeros:
+        print("\nTrue:", r, le.classes_[r])
+        for cidx,v in sorted(nonzeros, key=lambda x:-x[1])[:10]:
+            print("   Pred:", cidx, le.classes_[cidx], "=>", v)
 
-    df = pd.DataFrame({"true": true_labels, "pred": pred_labels})
-    df.to_csv("evaluation_results.csv", index=False)
-    print("Saved → evaluation_results.csv")
-
-
-# ----------------------------
-# MAIN
-# ----------------------------
-def main():
-
-    json_path = "project.json"
-    model_path = "model_folder"
-    encoder_path = "encoders/label_encoder.pkl"
-
-    texts, labels = load_labelstudio(json_path)
-
-    X_train, X_test, y_train_raw, y_test_raw = prepare_data(texts, labels)
-
-    tokenizer, model, le = load_model(model_path, encoder_path)
-
-    # encode labels
-    y_train = le.transform(y_train_raw)
-    y_test = le.transform(y_test_raw)
-
-    # predict
-    y_pred = predict_single(X_test, tokenizer, model)
-
-    evaluate(y_test, y_pred, le)
-
-
-if __name__ == "__main__":
-    main()
+# ---------- 9) save full prediction csv ----------
+out_df = pd.DataFrame({
+    "text": X_test,
+    "true_index": y_test,
+    "true_label": [le.inverse_transform([i])[0] for i in y_test],
+    "pred_index": pred_idx,
+    "pred_label": [le.inverse_transform([i])[0] for i in pred_idx],
+    "pred_conf": pred_conf
+})
+out_df.to_csv("diag_predictions.csv", index=False)
+print("\nSaved diag_predictions.csv (first 200 chars of each text truncated).")

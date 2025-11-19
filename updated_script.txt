@@ -1,75 +1,81 @@
 import json
-import os
-import numpy as np
-from sklearn.model_selection import train_test_split
+import pickle
+import requests
 from sklearn.metrics import classification_report, accuracy_score
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch
 
 # -----------------------------
-# 1. Load your fine-tuned model
+# Step 1: Load old encoder
 # -----------------------------
-MODEL_DIR = r"E:\Featsystems\evaluation_matrix\finetuned_multitask_model"
-print("Loading model from:", MODEL_DIR)
+encoder_path = "path_to_encoder_2800.pkl"  # Replace with your encoder path
+with open(encoder_path, "rb") as f:
+    old_encoder = pickle.load(f)
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model.to(device)
-model.eval()
+known_labels = old_encoder.classes_
+print(f"Model can predict {len(known_labels)} labels.")
 
 # -----------------------------
-# 2. Load cleaned dataset
+# Step 2: Load your Label Studio dataset using your function
 # -----------------------------
-DATA_PATH = r"E:\Featsystems\evaluation_matrix\cleaned_dataset.jsonl"
+def load_labelstudio(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-texts = []
-labels = []
+    texts = []
+    labels = []
 
-with open(DATA_PATH, "r", encoding="utf-8") as f:
-    for line in f:
-        d = json.loads(line)
-        texts.append(d["text"])
-        labels.append(d["labels"][0])  # single-label
+    for task in data:
+        text = task["data"].get("html") or task["data"].get("text")  # fallback if key differs
 
-# Map label -> id
-unique_labels = sorted(list(set(labels)))
-label_to_id = {label: idx for idx, label in enumerate(unique_labels)}
-id_to_label = {idx: label for label, idx in label_to_id.items()}
+        for ann in task.get("annotations", []):
+            for res in ann.get("result", []):
+                if res.get("type") == "taxonomy":
+                    cats = res["value"].get("taxonomy", [])
+                    if isinstance(cats, list) and len(cats) > 0:
+                        full_label = " > ".join(cats)  # FULL PATH
+                        texts.append(text)
+                        labels.append(full_label)
 
-y_true = [label_to_id[x] for x in labels]
+    return texts, labels
 
-# -----------------------------
-# 3. Tokenization
-# -----------------------------
-encodings = tokenizer(
-    texts,
-    truncation=True,
-    padding=True,
-    max_length=256,
-    return_tensors="pt"
-)
+dataset_path = "path_to_5200_dataset.json"  # Replace with your dataset path
+texts, true_labels_raw = load_labelstudio(dataset_path)
 
 # -----------------------------
-# 4. Run model predictions
+# Step 3: Filter true labels to known labels
 # -----------------------------
-input_ids = encodings["input_ids"].to(device)
-attention_mask = encodings["attention_mask"].to(device)
+def map_to_known_label(label, known_labels):
+    return label if label in known_labels else "UNK"
 
-with torch.no_grad():
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-    preds = torch.argmax(outputs.logits, dim=1).cpu().numpy()
+true_labels = [map_to_known_label(lbl, known_labels) for lbl in true_labels_raw]
 
 # -----------------------------
-# 5. Metrics
+# Step 4: Batch ML backend predictions (safe for prod)
 # -----------------------------
-print("\n✔ Accuracy:", accuracy_score(y_true, preds))
+ml_backend_url = "http://localhost:9090/predict"  # Replace with your backend URL
+batch_size = 50  # Adjust depending on backend load
 
-print("\n✔ Classification Report:")
-print(classification_report(
-    y_true,
-    preds,
-    target_names=[id_to_label[i] for i in range(len(unique_labels))],
-    zero_division=0
-))
+def ml_backend_predict_batch(texts, url=ml_backend_url, batch_size=50):
+    predictions = []
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i+batch_size]
+        payload = {"data": [{"text": txt} for txt in batch_texts]}
+        try:
+            response = requests.post(url, json=payload)
+            response_json = response.json()
+            # Adjust depending on your backend response structure
+            for pred in response_json['predictions']:
+                label = pred if pred in known_labels else "UNK"
+                predictions.append(label)
+        except Exception as e:
+            print(f"Batch prediction error at index {i}-{i+len(batch_texts)-1}: {e}")
+            predictions.extend(["UNK"] * len(batch_texts))
+    return predictions
+
+pred_labels = ml_backend_predict_batch(texts, batch_size=batch_size)
+
+# -----------------------------
+# Step 5: Compute evaluation metrics
+# -----------------------------
+print("Accuracy:", accuracy_score(true_labels, pred_labels))
+print("\nClassification Report:")
+print(classification_report(true_labels, pred_labels, labels=list(known_labels)+["UNK"]))

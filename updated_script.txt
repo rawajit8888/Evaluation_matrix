@@ -1,0 +1,116 @@
+import json
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+import pandas as pd
+import pickle
+
+# ----------------------------
+# Load JSON from Label Studio
+# ----------------------------
+def load_labelstudio(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    texts = []
+    labels = []
+
+    for task in data:
+        text = task["data"]["html"]
+
+        for ann in task.get("annotations", []):
+            for res in ann.get("result", []):
+                if res.get("type") == "taxonomy":
+                    cats = res["value"].get("taxonomy", [])
+                    if isinstance(cats, list) and len(cats) > 0:
+                        full_label = " > ".join(cats)   # FULL PATH
+                        texts.append(text)
+                        labels.append(full_label)
+
+    return texts, labels
+
+
+# ----------------------------
+# Split Data
+# ----------------------------
+def prepare_data(texts, labels):
+    return train_test_split(texts, labels, test_size=0.2, random_state=42)
+
+
+# ----------------------------
+# Load Model + Encoder
+# ----------------------------
+def load_model(model_path, encoder_path):
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForSequenceClassification.from_pretrained(model_path)
+
+    with open(encoder_path, "rb") as f:
+        le = pickle.load(f)
+
+    return tokenizer, model, le
+
+
+# ----------------------------
+# Prediction Function
+# ----------------------------
+def predict_single(texts, tokenizer, model):
+    preds = []
+    model.eval()
+
+    with torch.no_grad():
+        for text in texts:
+            enc = tokenizer(text, truncation=True, padding=True, return_tensors="pt")
+            logits = model(**enc).logits
+            pred = torch.argmax(logits, dim=1).item()
+            preds.append(pred)
+
+    return preds
+
+
+# ----------------------------
+# Evaluation
+# ----------------------------
+def evaluate(y_true, y_pred, le):
+
+    true_labels = le.inverse_transform(y_true)
+    pred_labels = le.inverse_transform(y_pred)
+
+    print("\nClassification Report:\n")
+    print(classification_report(true_labels, pred_labels, zero_division=0))
+
+    print("\nAccuracy:", accuracy_score(true_labels, pred_labels))
+
+    df = pd.DataFrame({"true": true_labels, "pred": pred_labels})
+    df.to_csv("evaluation_results.csv", index=False)
+    print("Saved → evaluation_results.csv")
+
+
+# ----------------------------
+# MAIN
+# ----------------------------
+def main():
+
+    json_path = "project.json"
+    model_path = "model_folder"
+    encoder_path = "encoders/label_encoder.pkl"
+
+    texts, labels = load_labelstudio(json_path)
+
+    X_train, X_test, y_train_raw, y_test_raw = prepare_data(texts, labels)
+
+    tokenizer, model, le = load_model(model_path, encoder_path)
+
+    # encode labels
+    y_train = le.transform(y_train_raw)
+    y_test = le.transform(y_test_raw)
+
+    # predict
+    y_pred = predict_single(X_test, tokenizer, model)
+
+    evaluate(y_test, y_pred, le)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,32 @@
+def prepare_data(df, label_column="taxonomy", random_state=42):
+    """
+    Performs safe train-test split ensuring all labels are included.
+    If a label has only 1 sample → go to TRAIN.
+    Otherwise → 1 sample goes to TEST, rest to TRAIN.
+    """
+
+    test_rows = []
+    train_rows = []
+
+    for label, group in df.groupby(label_column):
+        if len(group) == 1:
+            # Only 1 sample → keep in TRAIN only
+            train_rows.append(group)
+        else:
+            # 1 sample forced into TEST → rest to TRAIN
+            test_sample = group.sample(1, random_state=random_state)
+            train_sample = group.drop(test_sample.index)
+
+            test_rows.append(test_sample)
+            train_rows.append(train_sample)
+
+    train_df = pd.concat(train_rows).sample(frac=1, random_state=random_state).reset_index(drop=True)
+    test_df  = pd.concat(test_rows).sample(frac=1, random_state=random_state).reset_index(drop=True)
+
+    # Print summary
+    print("Train size:", len(train_df))
+    print("Test size:", len(test_df))
+    print("Unique labels in TRAIN:", train_df[label_column].nunique())
+    print("Unique labels in TEST:",  test_df[label_column].nunique())
+
+    return train_df, test_df
